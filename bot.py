@@ -11,7 +11,7 @@ from datetime import datetime, date, timedelta
 import psycopg2
 import psycopg2.extras
 from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ConversationHandler, ContextTypes, filters,
