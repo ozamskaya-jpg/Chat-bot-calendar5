@@ -300,8 +300,8 @@ def owner_only(update: Update):
     uid_ = update.effective_user.id if update.effective_user else None
     return uid_ == OWNER
  
-def main_menu_kb():
-        buttons = [
+def main_menu_kb(user_id: int = None):
+    buttons = [
         [InlineKeyboardButton("📅 Записаться",        callback_data="book")],
         [InlineKeyboardButton("🔄 Перенести запись",  callback_data="reschedule")],
         [InlineKeyboardButton("📋 Мои записи",        callback_data="my_bookings")],
