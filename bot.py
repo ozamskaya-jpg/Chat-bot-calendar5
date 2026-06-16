@@ -301,12 +301,15 @@ def owner_only(update: Update):
     return uid_ == OWNER
  
 def main_menu_kb():
-    return InlineKeyboardMarkup([
+        buttons = [
         [InlineKeyboardButton("📅 Записаться",        callback_data="book")],
         [InlineKeyboardButton("🔄 Перенести запись",  callback_data="reschedule")],
         [InlineKeyboardButton("📋 Мои записи",        callback_data="my_bookings")],
         [InlineKeyboardButton("❌ Отменить запись",   callback_data="cancel_booking")],
-    ])
+    ]
+    if user_id == OWNER:
+        buttons.append([InlineKeyboardButton("🗓 Открыть календарь", web_app=WebAppInfo(url="https://calendar-interface-finamira.netlify.app"))])
+    return InlineKeyboardMarkup(buttons)
  
 # ── HTTP API ──────────────────────────────────────────────────────────────────
  
@@ -583,7 +586,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     await update.message.reply_text(
         "👋 Привет! Выберите действие:",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(update.effective_user.id),
     )
  
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
