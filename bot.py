@@ -84,8 +84,11 @@ def init_db():
                 )
             cur.execute("""CREATE TABLE IF NOT EXISTS vacations
                            (id SERIAL PRIMARY KEY,
-                            datestart TEXT NOT NULL,
-                            dateend   TEXT NOT NULL)""")
+                            date_start TEXT,
+                            date_end   TEXT)""")
+            # Миграция: гарантируем наличие колонок date_start/date_end
+            cur.execute("ALTER TABLE vacations ADD COLUMN IF NOT EXISTS date_start TEXT")
+            cur.execute("ALTER TABLE vacations ADD COLUMN IF NOT EXISTS date_end   TEXT")
             cur.execute("""INSERT INTO settings (key, value) VALUES
                            ('wd','[1,2,3,4,5]'),
                            ('ws','"09:00"'),
@@ -119,7 +122,7 @@ def load():
                  "r1": rget(r, "reminded_1h", False)}
                 for r in cur.fetchall()
             ]
-            cur.execute("SELECT id, datestart AS s, dateend AS e FROM vacations")
+            cur.execute("SELECT id, date_start AS s, date_end AS e FROM vacations")
             vacs = [{"id": r["id"], "s": r["s"], "e": r["e"]}
                     for r in cur.fetchall()]
         return {
@@ -153,7 +156,7 @@ def add_vacation(datestart: str, dateend: str):
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO vacations (datestart, dateend) VALUES (%s, %s)",
+                "INSERT INTO vacations (date_start, date_end) VALUES (%s, %s)",
                 (datestart, dateend),
             )
         conn.commit()
@@ -454,7 +457,7 @@ async def api_update_settings(request: web.Request) -> web.Response:
                     cur.execute("DELETE FROM vacations")
                     for v in data["vacs"]:
                         cur.execute(
-                            "INSERT INTO vacations (datestart, dateend) VALUES (%s, %s)",
+                            "INSERT INTO vacations (date_start, date_end) VALUES (%s, %s)",
                             (v["s"], v["e"]),
                         )
             conn.commit()
