@@ -1203,40 +1203,48 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
  
 async def run_all():
     init_db()
- 
+
     tg_app = build_telegram_app()
     tg_app.add_error_handler(on_error)
     await tg_app.initialize()
     await tg_app.start()
- 
-    # Новый деплой всегда забирает polling на себя.
-    # Если старый контейнер ещё жив — будет короткий Conflict,
-    # PTB автоматически ретраит и подхватывает polling.
-    await tg_app.bot.delete_webhook(drop_pending_updates=True)
-    await tg_app.updater.start_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-    )
-    logger.info("✅ Polling запущен.")
- 
+
+    webhook_url = os.environ.get("WEBHOOK_URL", "").rstrip("/")
+
     web_app = create_web_app()
-    runner  = web.AppRunner(web_app)
+
+    # Добавляем эндпоинт для webhook
+    async def telegram_webhook(request: web.Request) -> web.Response:
+        data = await request.json()
+        update = Update.de_json(data, tg_app.bot)
+        await tg_app.process_update(update)
+        return web.Response(status=200)
+
+    web_app.router.add_post("/telegram", telegram_webhook)
+
+    runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
- 
+
+    # Регистрируем webhook в Telegram
+    await tg_app.bot.set_webhook(
+        url=webhook_url + "/telegram",
+        drop_pending_updates=True,
+    )
+    logger.info("✅ Webhook установлен: %s/telegram", webhook_url)
     logger.info("✅ Бот v5 запущен (HTTP API на порту %s)", PORT)
- 
-    # Graceful shutdown — ждём SIGTERM (Railway) или SIGINT (Ctrl+C)
+
+    # Graceful shutdown
     stop_event = asyncio.Event()
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
- 
+
     await stop_event.wait()
- 
+
     logger.info("Получен сигнал остановки, завершаем работу...")
-    await tg_app.updater.stop()
+    await tg_app.bot.delete_webhook()
     await tg_app.stop()
     await tg_app.shutdown()
     await runner.cleanup()
