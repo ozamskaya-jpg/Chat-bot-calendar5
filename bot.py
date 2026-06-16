@@ -2,11 +2,12 @@ import os
 import json
 import logging
 import random
+import signal
 import string
 import asyncio
 from io import BytesIO
 from datetime import datetime, date, timedelta
-
+ 
 import psycopg2
 import psycopg2.extras
 from aiohttp import web
@@ -15,49 +16,31 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ConversationHandler, ContextTypes, filters,
 )
-
+ 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
-
+ 
 TOKEN     = os.environ["BOT_TOKEN"]
 OWNER     = int(os.environ["OWNER_ID"])
 DB_URL    = os.environ["DATABASE_URL"]
 API_TOKEN = os.environ.get("API_TOKEN", "changemesecrettoken")
 PORT      = int(os.environ.get("PORT", 8080))
-
+ 
 ASK_DATE, ASK_SLOT, ASK_NAME, ASK_PHONE, CONFIRM = range(5)
 RSCH_PICK, RSCH_DATE, RSCH_SLOT = range(5, 8)
 SET_MENU, SET_WD, SET_WS, SET_LS, SET_SD, SET_VAC, SET_DELVAC = range(10, 17)
-
+ 
 RU_MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
 RU_DAYS   = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
-
+ 
 # ── DB ────────────────────────────────────────────────────────────────────────
-
+ 
 def get_conn():
     return psycopg2.connect(DB_URL, sslmode="require")
-
-# Глобальное соединение для advisory-lock (держим открытым весь срок жизни процесса)
-_lock_conn = None
-
-def acquire_single_instance_lock() -> bool:
-    """Берём эксклюзивную блокировку в PostgreSQL.
-    Если её уже держит другой процесс (второй бот) — вернёт False,
-    и этот экземпляр не будет запускать polling."""
-    global _lock_conn
-    try:
-        _lock_conn = psycopg2.connect(DB_URL, sslmode="require")
-        _lock_conn.autocommit = True
-        with _lock_conn.cursor() as cur:
-            # Произвольный, но постоянный ключ блокировки для этого бота
-            cur.execute("SELECT pg_try_advisory_lock(817264531)")
-            got = cur.fetchone()[0]
-        return bool(got)
-    except Exception as e:
-        logger.warning("Не удалось взять advisory lock: %s", e)
-        # Если БД недоступна для лока — не блокируем запуск
-        return True
-
+ 
+ 
 def init_db():
     conn = get_conn()
     try:
@@ -100,7 +83,7 @@ def init_db():
         conn.commit()
     finally:
         conn.close()
-
+ 
 def load():
     conn = get_conn()
     try:
@@ -137,7 +120,7 @@ def load():
         }
     finally:
         conn.close()
-
+ 
 def save_settings(d):
     conn = get_conn()
     try:
@@ -150,7 +133,7 @@ def save_settings(d):
         conn.commit()
     finally:
         conn.close()
-
+ 
 def add_vacation(datestart: str, dateend: str):
     conn = get_conn()
     try:
@@ -162,7 +145,7 @@ def add_vacation(datestart: str, dateend: str):
         conn.commit()
     finally:
         conn.close()
-
+ 
 def del_vacation(vac_id: int):
     conn = get_conn()
     try:
@@ -171,7 +154,7 @@ def del_vacation(vac_id: int):
         conn.commit()
     finally:
         conn.close()
-
+ 
 def save_event(ev):
     conn = get_conn()
     try:
@@ -188,7 +171,7 @@ def save_event(ev):
         conn.commit()
     finally:
         conn.close()
-
+ 
 def update_event(eid, newdate, newst, newen):
     conn = get_conn()
     try:
@@ -203,7 +186,7 @@ def update_event(eid, newdate, newst, newen):
         conn.commit()
     finally:
         conn.close()
-
+ 
 def delete_event(eid):
     conn = get_conn()
     try:
@@ -212,7 +195,7 @@ def delete_event(eid):
         conn.commit()
     finally:
         conn.close()
-
+ 
 def mark_reminded(eid, col):
     conn = get_conn()
     try:
@@ -221,7 +204,7 @@ def mark_reminded(eid, col):
         conn.commit()
     finally:
         conn.close()
-
+ 
 def import_events(new_evs):
     added = skipped = 0
     conn = get_conn()
@@ -247,25 +230,25 @@ def import_events(new_evs):
         return added, skipped
     finally:
         conn.close()
-
+ 
 # ── Utils ─────────────────────────────────────────────────────────────────────
-
+ 
 def t2m(t):
     h, m = map(int, t.split(":"))
     return h * 60 + m
-
+ 
 def m2t(m):
     return f"{m // 60:02d}:{m % 60:02d}"
-
+ 
 def uid():
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
-
+ 
 def is_vac(d, s):
     return any(v["s"] <= s <= v["e"] for v in d.get("vacs", []))
-
+ 
 def ev_of(d, s):
     return [e for e in d.get("evs", []) if e["d"] == s]
-
+ 
 def free_slots(d, s):
     dt = datetime.strptime(s, "%Y-%m-%d")
     js_dow = dt.weekday() + 1
@@ -293,11 +276,11 @@ def free_slots(d, s):
                 res.append(m2t(m))
         m += slot
     return res
-
+ 
 def fmt_date(s):
     dt = datetime.strptime(s, "%Y-%m-%d")
     return f"{dt.day} {RU_MONTHS[dt.month - 1]} ({RU_DAYS[dt.weekday()]})"
-
+ 
 def next_working_days(d, n=7):
     result  = []
     cur_day = date.today()
@@ -307,16 +290,16 @@ def next_working_days(d, n=7):
             result.append(s)
         cur_day += timedelta(days=1)
     return result
-
+ 
 def user_events(tgid):
     d = load()
     return [e for e in d["evs"]
             if e.get("tgid") == tgid and e.get("t") == "c"]
-
+ 
 def owner_only(update: Update):
     uid_ = update.effective_user.id if update.effective_user else None
     return uid_ == OWNER
-
+ 
 def main_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 Записаться",        callback_data="book")],
@@ -324,15 +307,15 @@ def main_menu_kb():
         [InlineKeyboardButton("📋 Мои записи",        callback_data="my_bookings")],
         [InlineKeyboardButton("❌ Отменить запись",   callback_data="cancel_booking")],
     ])
-
+ 
 # ── HTTP API ──────────────────────────────────────────────────────────────────
-
+ 
 def check_token(request: web.Request) -> bool:
     token = request.rel_url.query.get("token", "")
     if not token:
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
     return token == API_TOKEN
-
+ 
 async def api_get_events(request: web.Request) -> web.Response:
     if not check_token(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
@@ -348,7 +331,7 @@ async def api_get_events(request: web.Request) -> web.Response:
         for e in evs
     ]
     return web.json_response({"events": result})
-
+ 
 async def api_get_slots(request: web.Request) -> web.Response:
     if not check_token(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
@@ -361,7 +344,7 @@ async def api_get_slots(request: web.Request) -> web.Response:
         return web.json_response({"date": datestr, "slots": slots})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
-
+ 
 async def api_book(request: web.Request) -> web.Response:
     try:
         data = await request.json()
@@ -402,7 +385,7 @@ async def api_book(request: web.Request) -> web.Response:
         })
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
-
+ 
 async def api_delete_event(request: web.Request) -> web.Response:
     if not check_token(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
@@ -411,10 +394,49 @@ async def api_delete_event(request: web.Request) -> web.Response:
         return web.json_response({"error": "id param required"}, status=400)
     delete_event(eid)
     return web.json_response({"success": True, "deleted_id": eid})
-
+ 
+async def api_create_event(request: web.Request) -> web.Response:
+    """Generic event create from calendar: any type ('c','b','e'), no slot check."""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    if data.get("token") != API_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    for field in ["date", "starttime", "name"]:
+        if not data.get(field):
+            return web.json_response({"error": f"Field {field} required"}, status=400)
+    try:
+        d        = load()
+        datestr  = data["date"]
+        timestr  = data["starttime"]
+        etype    = data.get("type", "c")
+        if etype not in ("c", "b", "e"):
+            etype = "c"
+        endtime  = data.get("endtime") or m2t(t2m(timestr) + int(d["sd"]))
+        ev_id    = uid()
+        ev = {
+            "id": ev_id, "t": etype, "n": data["name"],
+            "d": datestr, "st": timestr, "en": endtime,
+            "ph": data.get("phone", ""), "no": data.get("note", ""),
+            "tgid": None,
+        }
+        save_event(ev)
+        return web.json_response({
+            "success": True,
+            "event": {
+                "id": ev_id, "type": etype, "date": datestr,
+                "starttime": timestr, "endtime": endtime,
+                "name": data["name"], "phone": data.get("phone", ""),
+                "note": data.get("note", ""),
+            },
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+ 
 async def api_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "bot": "chat-bot-calendar4"})
-
+ 
 async def api_get_calendar_data(request: web.Request) -> web.Response:
     if not check_token(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
@@ -435,7 +457,7 @@ async def api_get_calendar_data(request: web.Request) -> web.Response:
             for e in d.get("evs", [])
         ],
     })
-
+ 
 async def api_update_settings(request: web.Request) -> web.Response:
     try:
         data = await request.json()
@@ -466,7 +488,7 @@ async def api_update_settings(request: web.Request) -> web.Response:
         return web.json_response({"success": True})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
-
+ 
 async def api_add_vacation(request: web.Request) -> web.Response:
     try:
         data = await request.json()
@@ -476,7 +498,7 @@ async def api_add_vacation(request: web.Request) -> web.Response:
         return web.json_response({"error": "Unauthorized"}, status=401)
     add_vacation(data["s"], data["e"])
     return web.json_response({"success": True})
-
+ 
 async def api_delete_vacation(request: web.Request) -> web.Response:
     if not check_token(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
@@ -485,7 +507,7 @@ async def api_delete_vacation(request: web.Request) -> web.Response:
         return web.json_response({"error": "id required"}, status=400)
     del_vacation(int(vac_id))
     return web.json_response({"success": True})
-
+ 
 @web.middleware
 async def cors_middleware(request: web.Request, handler):
     if request.method == "OPTIONS":
@@ -499,7 +521,7 @@ async def cors_middleware(request: web.Request, handler):
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
-
+ 
 def create_web_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_route("OPTIONS", "/{path_info:.*}", lambda r: web.Response())
@@ -507,15 +529,16 @@ def create_web_app() -> web.Application:
     app.router.add_get   ("/events",            api_get_events)
     app.router.add_get   ("/slots",             api_get_slots)
     app.router.add_post  ("/book",              api_book)
+    app.router.add_post  ("/event",             api_create_event)
     app.router.add_delete("/event",             api_delete_event)
     app.router.add_get   ("/calendar-data",     api_get_calendar_data)
     app.router.add_post  ("/calendar-settings", api_update_settings)
     app.router.add_post  ("/vacation",          api_add_vacation)
     app.router.add_delete("/vacation",          api_delete_vacation)
     return app
-
+ 
 # ── Reminders ─────────────────────────────────────────────────────────────────
-
+ 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     d   = load()
     now = datetime.now()
@@ -553,16 +576,16 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                 mark_reminded(ev["id"], "reminded_1h")
             except Exception as e:
                 logger.warning("Reminder 1h error for %s: %s", ev["id"], e)
-
+ 
 # ── /start  /cancel ───────────────────────────────────────────────────────────
-
+ 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     await update.message.reply_text(
         "👋 Привет! Выберите действие:",
         reply_markup=main_menu_kb(),
     )
-
+ 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     await update.message.reply_text(
@@ -570,9 +593,9 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu_kb(),
     )
     return ConversationHandler.END
-
+ 
 # ── Booking flow ──────────────────────────────────────────────────────────────
-
+ 
 async def cb_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     d    = load()
@@ -586,7 +609,7 @@ async def cb_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Выберите дату:", reply_markup=InlineKeyboardMarkup(kb)
     )
     return ASK_DATE
-
+ 
 async def cb_ask_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     s = update.callback_query.data.replace("date:", "")
@@ -604,20 +627,20 @@ async def cb_ask_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
     return ASK_SLOT
-
+ 
 async def cb_ask_slot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     ctx.user_data["slot"] = update.callback_query.data.replace("slot:", "")
     await update.callback_query.edit_message_text("Введите ваше имя:")
     return ASK_NAME
-
+ 
 async def got_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["name"] = update.message.text.strip()
     await update.message.reply_text(
         "Введите номер телефона (или «-» если не хотите оставлять):"
     )
     return ASK_PHONE
-
+ 
 async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["phone"] = update.message.text.strip()
     d_str = ctx.user_data["date"]
@@ -637,7 +660,7 @@ async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
     return CONFIRM
-
+ 
 async def cb_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     d_str = ctx.user_data["date"]
@@ -665,9 +688,9 @@ async def cb_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         + "\n📅 " + fmt_date(d_str) + ", " + sl + "\u2013" + end,
     )
     return ConversationHandler.END
-
+ 
 # ── My bookings / cancel ──────────────────────────────────────────────────────
-
+ 
 async def cb_my_bookings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     evs = user_events(update.effective_user.id)
@@ -680,7 +703,7 @@ async def cb_my_bookings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for e in evs
     )
     await update.callback_query.edit_message_text(text)
-
+ 
 async def cb_cancel_booking(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     evs = user_events(update.effective_user.id)
@@ -699,22 +722,22 @@ async def cb_cancel_booking(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Выберите запись для отмены:",
         reply_markup=InlineKeyboardMarkup(kb),
     )
-
+ 
 async def cb_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     eid = update.callback_query.data.replace("del:", "")
     delete_event(eid)
     await update.callback_query.edit_message_text("✅ Запись отменена.")
     await ctx.bot.send_message(OWNER, "❌ Запись " + eid + " отменена пользователем.")
-
+ 
 async def cb_back_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     await update.callback_query.edit_message_text(
         "Выберите действие:", reply_markup=main_menu_kb()
     )
-
+ 
 # ── Reschedule ────────────────────────────────────────────────────────────────
-
+ 
 async def cb_reschedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     evs = user_events(update.effective_user.id)
@@ -734,7 +757,7 @@ async def cb_reschedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(kb),
     )
     return RSCH_PICK
-
+ 
 async def cb_rsch_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     ctx.user_data["rsch_id"] = update.callback_query.data.replace("rpick:", "")
@@ -746,7 +769,7 @@ async def cb_rsch_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Выберите новую дату:", reply_markup=InlineKeyboardMarkup(kb)
     )
     return RSCH_DATE
-
+ 
 async def cb_rsch_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     s = update.callback_query.data.replace("rdate:", "")
@@ -764,7 +787,7 @@ async def cb_rsch_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
     return RSCH_SLOT
-
+ 
 async def cb_rsch_slot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     new_sl  = update.callback_query.data.replace("rslot:", "")
@@ -787,7 +810,7 @@ async def cb_rsch_slot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             + "\nСтало: " + fmt_date(new_d) + ", " + new_sl + "\u2013" + new_end,
         )
     return ConversationHandler.END
-
+ 
 async def cb_cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     ctx.user_data.clear()
@@ -795,9 +818,9 @@ async def cb_cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "❌ Отменено. Выберите действие:", reply_markup=main_menu_kb()
     )
     return ConversationHandler.END
-
+ 
 # ── Settings (OWNER) ──────────────────────────────────────────────────────────
-
+ 
 def settings_text(d: dict) -> str:
     wd_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     wd_str   = ", ".join(wd_names[w - 1] for w in sorted(d["wd"])) if d["wd"] else "—"
@@ -811,7 +834,7 @@ def settings_text(d: dict) -> str:
         "⏱ Длит. слота: " + str(d["sd"]) + " мин\n"
         "🏖 Отпуск/выходные:\n" + vacs_str
     )
-
+ 
 def settings_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 Рабочие дни",     callback_data="set_wd")],
@@ -822,7 +845,7 @@ def settings_kb():
         [InlineKeyboardButton("🗑 Удалить отпуск",  callback_data="set_delvac")],
         [InlineKeyboardButton("✅ Закрыть",         callback_data="set_close")],
     ])
-
+ 
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not owner_only(update):
         await update.message.reply_text("⛔ Нет доступа.")
@@ -832,7 +855,7 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         settings_text(d), parse_mode="Markdown", reply_markup=settings_kb()
     )
     return SET_MENU
-
+ 
 async def cb_set_wd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     d       = load()
@@ -850,7 +873,7 @@ async def cb_set_wd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Выберите рабочие дни:", reply_markup=InlineKeyboardMarkup(buttons)
     )
     return SET_WD
-
+ 
 async def cb_tog_wd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     dv      = int(update.callback_query.data.replace("togwd:", ""))
@@ -875,7 +898,7 @@ async def cb_tog_wd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Выберите рабочие дни:", reply_markup=InlineKeyboardMarkup(buttons)
     )
     return SET_WD
-
+ 
 async def cb_set_wtime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     d = load()
@@ -885,7 +908,7 @@ async def cb_set_wtime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
     return SET_WS
-
+ 
 async def got_wtime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not owner_only(update):
         return ConversationHandler.END
@@ -908,7 +931,7 @@ async def got_wtime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         settings_text(d), parse_mode="Markdown", reply_markup=settings_kb()
     )
     return SET_MENU
-
+ 
 async def cb_set_lunch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     d = load()
@@ -918,7 +941,7 @@ async def cb_set_lunch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
     return SET_LS
-
+ 
 async def got_lunch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not owner_only(update):
         return ConversationHandler.END
@@ -947,7 +970,7 @@ async def got_lunch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         settings_text(d), parse_mode="Markdown", reply_markup=settings_kb()
     )
     return SET_MENU
-
+ 
 async def cb_set_sd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     d  = load()
@@ -965,7 +988,7 @@ async def cb_set_sd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(kb),
     )
     return SET_SD
-
+ 
 async def cb_set_sd_val(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     sd_val  = int(update.callback_query.data.replace("setsd:", ""))
@@ -977,7 +1000,7 @@ async def cb_set_sd_val(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         settings_text(d), parse_mode="Markdown", reply_markup=settings_kb()
     )
     return SET_MENU
-
+ 
 async def cb_set_vac(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     await update.callback_query.edit_message_text(
@@ -985,7 +1008,7 @@ async def cb_set_vac(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
     return SET_VAC
-
+ 
 async def got_vac(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not owner_only(update):
         return ConversationHandler.END
@@ -1007,7 +1030,7 @@ async def got_vac(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         settings_text(d), parse_mode="Markdown", reply_markup=settings_kb()
     )
     return SET_MENU
-
+ 
 async def cb_set_delvac(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     d    = load()
@@ -1027,7 +1050,7 @@ async def cb_set_delvac(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Выберите отпуск для удаления:", reply_markup=InlineKeyboardMarkup(buttons)
     )
     return SET_DELVAC
-
+ 
 async def cb_del_vac(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     vac_id = int(update.callback_query.data.replace("delvac:", ""))
@@ -1037,7 +1060,7 @@ async def cb_del_vac(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         settings_text(d), parse_mode="Markdown", reply_markup=settings_kb()
     )
     return SET_MENU
-
+ 
 async def cb_set_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     d = load()
@@ -1045,14 +1068,14 @@ async def cb_set_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         settings_text(d), parse_mode="Markdown", reply_markup=settings_kb()
     )
     return SET_MENU
-
+ 
 async def cb_set_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     await update.callback_query.edit_message_text("✅ Настройки сохранены.")
     return ConversationHandler.END
-
+ 
 # ── JSON import ───────────────────────────────────────────────────────────────
-
+ 
 async def handle_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not owner_only(update):
         return
@@ -1072,15 +1095,15 @@ async def handle_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         await update.message.reply_text("❌ Ошибка: " + str(e))
-
+ 
 # ── Build app ─────────────────────────────────────────────────────────────────
-
+ 
 def build_telegram_app():
     app = Application.builder().token(TOKEN).build()
-
+ 
     start_fb  = CommandHandler("start",  cmd_start)
     cancel_fb = CommandHandler("cancel", cmd_cancel)
-
+ 
     book_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(cb_book, pattern="^book$")],
         states={
@@ -1098,7 +1121,7 @@ def build_telegram_app():
         per_message=False,
         conversation_timeout=600,
     )
-
+ 
     rsch_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(cb_reschedule, pattern="^reschedule$")],
         states={
@@ -1114,7 +1137,7 @@ def build_telegram_app():
         per_message=False,
         conversation_timeout=600,
     )
-
+ 
     settings_conv = ConversationHandler(
         entry_points=[CommandHandler("settings", cmd_settings)],
         states={
@@ -1149,7 +1172,7 @@ def build_telegram_app():
         per_message=False,
         conversation_timeout=600,
     )
-
+ 
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("cancel",  cmd_cancel))
     app.add_handler(book_conv)
@@ -1162,49 +1185,63 @@ def build_telegram_app():
     app.add_handler(MessageHandler(filters.Document.ALL,    handle_doc))
     app.job_queue.run_repeating(check_reminders, interval=300, first=10)
     return app
-
+ 
 # ── main ──────────────────────────────────────────────────────────────────────
-
+ 
+from telegram.error import Conflict, NetworkError, TimedOut
+ 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Глобальный обработчик ошибок, чтобы бот не падал из-за одногобага."""
-    logger.error("Ошибка при обработке апдейта: %s", context.error, exc_info=context.error)
-
+    """Глобальный обработчик ошибок.
+    Сетевые и Conflict-ошибки — временные, логируем коротко без трейсбека."""
+    err = context.error
+    if isinstance(err, Conflict):
+        logger.warning("Conflict (временно живы два экземпляра, старый скоро остановится).")
+    elif isinstance(err, (NetworkError, TimedOut)):
+        logger.warning("Сетевой сбой (временный, переподключаемся): %s", err)
+    else:
+        logger.error("Ошибка при обработке апдейта: %s", err, exc_info=err)
+ 
 async def run_all():
     init_db()
-
-    # ✅ Защита от двух одновременных экземпляров (причина ошибки Conflict).
-    # Если другой процесс уже ведёт polling — этот запускает только HTTP API.
-    is_polling_leader = acquire_single_instance_lock()
-
+ 
     tg_app = build_telegram_app()
     tg_app.add_error_handler(on_error)
     await tg_app.initialize()
     await tg_app.start()
-
-    if is_polling_leader:
-        # Снимаем webhook на всякий случай и сбрасываем хвост апдейтов
-        await tg_app.bot.delete_webhook(drop_pending_updates=True)
-        await tg_app.updater.start_polling(drop_pending_updates=True)
-        print("✅ Этот экземпляр — ведущий, polling запущен.")
-    else:
-        print("⚠️  Обнаружен другой экземпляр бота — polling НЕ запущен, "
-              "работает только HTTP API. Это предотвращает ошибку Conflict.")
-
+ 
+    # Новый деплой всегда забирает polling на себя.
+    # Если старый контейнер ещё жив — будет короткий Conflict,
+    # PTB автоматически ретраит и подхватывает polling.
+    await tg_app.bot.delete_webhook(drop_pending_updates=True)
+    await tg_app.updater.start_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
+    logger.info("✅ Polling запущен.")
+ 
     web_app = create_web_app()
     runner  = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-
-    print(f"✅ Бот v5 запущен (HTTP API на порту {PORT})")
-    print("   GET  /health")
-    print("   GET  /events?token=API_TOKEN[&month=YYYY-MM]")
-    print("   GET  /slots?token=API_TOKEN&date=YYYY-MM-DD")
-    print("   GET  /calendar-data?token=API_TOKEN")
-    print("   POST /book        (JSON body)")
-    print("   DELETE /event?token=API_TOKEN&id=EVENT_ID")
-
-    await asyncio.Event().wait()
-
+ 
+    logger.info("✅ Бот v5 запущен (HTTP API на порту %s)", PORT)
+ 
+    # Graceful shutdown — ждём SIGTERM (Railway) или SIGINT (Ctrl+C)
+    stop_event = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop_event.set)
+ 
+    await stop_event.wait()
+ 
+    logger.info("Получен сигнал остановки, завершаем работу...")
+    await tg_app.updater.stop()
+    await tg_app.stop()
+    await tg_app.shutdown()
+    await runner.cleanup()
+    logger.info("Бот остановлен.")
+ 
 if __name__ == "__main__":
     asyncio.run(run_all())
+ 
