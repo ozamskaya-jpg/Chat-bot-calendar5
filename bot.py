@@ -435,7 +435,7 @@ async def api_create_event(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=500)
  
 async def api_health(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "bot": "chat-bot-calendar4"})
+    return web.json_response({"status": "ok", "bot": "chat-bot-calendar5"})
  
 async def api_get_calendar_data(request: web.Request) -> web.Response:
     if not check_token(request):
