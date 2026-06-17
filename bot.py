@@ -11,11 +11,14 @@ from datetime import datetime, date, timedelta
 import psycopg2
 import psycopg2.extras
 from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, LabeledPrice
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo,
+    LabeledPrice,
+)
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ConversationHandler, ContextTypes, filters,
-    PreCheckoutQueryHandler,
+    PreCheckoutQueryHandler, ApplicationHandlerStop,
 )
  
 logging.basicConfig(level=logging.INFO)
@@ -28,11 +31,12 @@ OWNER     = int(os.environ["OWNER_ID"])
 DB_URL    = os.environ["DATABASE_URL"]
 API_TOKEN = os.environ.get("API_TOKEN", "changemesecrettoken")
 PORT      = int(os.environ.get("PORT", 8080))
-PAYMENT_PROVIDER_TOKEN = os.environ.get("PAYMENT_TOKEN", "")
-SUBSCRIPTION_PRICE = 90000  # 900 рублей в копейках
-SUBSCRIPTION_DAYS  = 30
-TRIAL_DAYS         = 90     # 3 месяца бесплатно
-CALENDAR_URL       = "https://calendar-interface-finamira.netlify.app"
+ 
+# ── Подписка на бота (оплата владельцем через ЮKassa) ──────────────────────────
+DEVELOPER_ID   = int(os.environ["DEVELOPER_ID"])           # ваш Telegram ID (не владельца)
+PROVIDER_TOKEN = os.environ["PROVIDER_TOKEN"]               # провайдер-токен ЮKassa из BotFather
+TRIAL_DAYS     = int(os.environ.get("TRIAL_DAYS", 90))      # 3 месяца пробного периода
+DEFAULT_PRICE  = int(os.environ.get("SUB_PRICE", 900))      # цена по умолчанию, руб/мес
  
 ASK_DATE, ASK_SLOT, ASK_NAME, ASK_PHONE, CONFIRM = range(5)
 RSCH_PICK, RSCH_DATE, RSCH_SLOT = range(5, 8)
@@ -78,12 +82,18 @@ def init_db():
             # Миграция: гарантируем наличие колонок date_start/date_end
             cur.execute("ALTER TABLE vacations ADD COLUMN IF NOT EXISTS date_start TEXT")
             cur.execute("ALTER TABLE vacations ADD COLUMN IF NOT EXISTS date_end   TEXT")
-            cur.execute("""CREATE TABLE IF NOT EXISTS subscriptions (
-                           user_id    BIGINT PRIMARY KEY,
-                           expires_at TIMESTAMP NOT NULL,
-                           is_trial   BOOLEAN DEFAULT TRUE,
-                           created_at TIMESTAMP DEFAULT NOW()
-                       )""")
+            # Подписка на бота (владелец платит за доступ)
+            cur.execute("""CREATE TABLE IF NOT EXISTS subscription
+                           (id INTEGER PRIMARY KEY DEFAULT 1,
+                            trial_start TEXT NOT NULL,
+                            price INTEGER NOT NULL DEFAULT 900,
+                            paid_until TEXT,
+                            CHECK (id = 1))""")
+            cur.execute(
+                "INSERT INTO subscription (id, trial_start, price) "
+                "VALUES (1, %s, %s) ON CONFLICT (id) DO NOTHING",
+                (date.today().strftime("%Y-%m-%d"), DEFAULT_PRICE),
+            )
             cur.execute("""INSERT INTO settings (key, value) VALUES
                            ('wd','[1,2,3,4,5]'),
                            ('ws','"09:00"'),
@@ -95,44 +105,6 @@ def init_db():
         conn.commit()
     finally:
         conn.close()
- 
-# ── Subscription ─────────────────────────────────────────────────────────────
- 
-def get_subscription(user_id: int):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT expires_at, is_trial FROM subscriptions WHERE user_id=%s",
-                (user_id,)
-            )
-            return cur.fetchone()
- 
-def set_subscription(user_id: int, days: int, is_trial: bool = False):
-    expires = datetime.now() + timedelta(days=days)
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO subscriptions (user_id, expires_at, is_trial)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (user_id) DO UPDATE
-                SET expires_at = EXCLUDED.expires_at,
-                    is_trial   = EXCLUDED.is_trial
-            """, (user_id, expires, is_trial))
-            conn.commit()
- 
-def has_active_subscription(user_id: int) -> bool:
-    if user_id == OWNER:
-        row = get_subscription(user_id)
-        return row is not None and row[0] > datetime.now()
-    return True  # клиенты всегда имеют доступ
- 
-def activate_trial(user_id: int) -> bool:
-    """Активирует пробный период если подписки ещё не было. Возвращает True если активирован."""
-    row = get_subscription(user_id)
-    if row is None:
-        set_subscription(user_id, TRIAL_DAYS, is_trial=True)
-        return True
-    return False
  
 def load():
     conn = get_conn()
@@ -201,6 +173,77 @@ def del_vacation(vac_id: int):
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM vacations WHERE id=%s", (vac_id,))
+        conn.commit()
+    finally:
+        conn.close()
+ 
+# ── Подписка на бота ─────────────────────────────────────────────────────────
+ 
+def load_subscription():
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("SELECT trial_start, price, paid_until FROM subscription WHERE id=1")
+            r = cur.fetchone()
+            return {
+                "trial_start": r["trial_start"],
+                "price": r["price"],
+                "paid_until": r["paid_until"],
+            }
+    finally:
+        conn.close()
+ 
+def is_subscription_active():
+    """True, если пробный период ещё идёт ИЛИ подписка оплачена и не истекла."""
+    sub   = load_subscription()
+    today = date.today()
+    trial_end = (
+        datetime.strptime(sub["trial_start"], "%Y-%m-%d").date()
+        + timedelta(days=TRIAL_DAYS)
+    )
+    if today <= trial_end:
+        return True
+    if sub["paid_until"]:
+        paid_until = datetime.strptime(sub["paid_until"], "%Y-%m-%d").date()
+        if today <= paid_until:
+            return True
+    return False
+ 
+def trial_days_left():
+    sub = load_subscription()
+    trial_end = (
+        datetime.strptime(sub["trial_start"], "%Y-%m-%d").date()
+        + timedelta(days=TRIAL_DAYS)
+    )
+    return (trial_end - date.today()).days
+ 
+def extend_subscription(months: int = 1):
+    """Продлевает оплаченный период на N месяцев от сегодня или от paid_until, если он в будущем."""
+    sub   = load_subscription()
+    today = date.today()
+    base  = today
+    if sub["paid_until"]:
+        paid_until = datetime.strptime(sub["paid_until"], "%Y-%m-%d").date()
+        if paid_until > base:
+            base = paid_until
+    new_until = base + timedelta(days=30 * months)
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE subscription SET paid_until=%s WHERE id=1",
+                (new_until.strftime("%Y-%m-%d"),),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return new_until
+ 
+def set_subscription_price(new_price: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE subscription SET price=%s WHERE id=1", (new_price,))
         conn.commit()
     finally:
         conn.close()
@@ -350,6 +393,10 @@ def owner_only(update: Update):
     uid_ = update.effective_user.id if update.effective_user else None
     return uid_ == OWNER
  
+def developer_only(update: Update):
+    uid_ = update.effective_user.id if update.effective_user else None
+    return uid_ == DEVELOPER_ID
+ 
 def main_menu_kb(user_id: int = None):
     buttons = [
         [InlineKeyboardButton("📅 Записаться",        callback_data="book")],
@@ -358,8 +405,7 @@ def main_menu_kb(user_id: int = None):
         [InlineKeyboardButton("❌ Отменить запись",   callback_data="cancel_booking")],
     ]
     if user_id == OWNER:
-        buttons.append([InlineKeyboardButton("🗓 Открыть календарь", web_app=WebAppInfo(url=CALENDAR_URL))])
-        buttons.append([InlineKeyboardButton("ℹ️ Моя подписка",      callback_data="sub_info")])
+        buttons.append([InlineKeyboardButton("🗓 Открыть календарь", web_app=WebAppInfo(url="https://calendar-interface-finamira.netlify.app"))])
     return InlineKeyboardMarkup(buttons)
  
 # ── HTTP API ──────────────────────────────────────────────────────────────────
@@ -631,67 +677,87 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning("Reminder 1h error for %s: %s", ev["id"], e)
  
-    # Напоминание об окончании пробного/платного периода за 7 дней
-    try:
-        conn = get_conn()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT user_id, expires_at, is_trial FROM subscriptions
-                WHERE expires_at BETWEEN NOW() + INTERVAL '6 days 23 hours'
-                               AND NOW() + INTERVAL '7 days 1 hour'
-            """)
-            rows = cur.fetchall()
-        conn.close()
-        for row in rows:
-            uid, exp, trial = row
-            kind = "пробный период" if trial else "подписка"
-            try:
-                await context.bot.send_message(
-                    uid,
-                    f"⚠️ Ваш {kind} заканчивается через 7 дней ({exp.strftime('%d.%m.%Y')}).\n\n"
-                    f"Оформите подписку за 900 ₽/мес чтобы продолжить пользоваться ботом.",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("💳 Оформить подписку", callback_data="subscribe")
-                    ]])
-                )
-            except Exception as e:
-                logger.warning("Sub reminder error for %s: %s", uid, e)
-    except Exception as e:
-        logger.warning("Sub reminder query error: %s", e)
- 
 # ── /start  /cancel ───────────────────────────────────────────────────────────
  
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
-    user_id = update.effective_user.id
+    uid_ = update.effective_user.id if update.effective_user else None
  
-    if user_id == OWNER:
-        trial_activated = activate_trial(user_id)
-        if trial_activated:
-            row = get_subscription(user_id)
-            exp = row[0].strftime('%d.%m.%Y')
+    if not is_subscription_active():
+        if uid_ == OWNER:
+            sub = load_subscription()
             await update.message.reply_text(
-                f"👋 Привет!\n\n"
-                f"🎁 Вам активирован бесплатный период на 3 месяца.\n"
-                f"Доступ действует до: {exp}\n\n"
-                f"Выберите действие:",
-                reply_markup=main_menu_kb(user_id),
+                "⛔ Пробный период закончился, и доступ к боту приостановлен.\n"
+                "Чтобы клиенты снова могли записываться, оформите подписку.\n\n"
+                "💳 Стоимость: *" + str(sub["price"]) + " ₽ / мес*\n\n"
+                "Нажмите /subscribe для оплаты.",
+                parse_mode="Markdown",
             )
             return
-        if not has_active_subscription(user_id):
+        else:
             await update.message.reply_text(
-                "⚠️ Ваша подписка истекла.\n\n"
-                "Оформите подписку за 900 ₽/мес чтобы продолжить.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("💳 Оформить подписку", callback_data="subscribe")
-                ]])
+                "🙁 Бот временно недоступен. Пожалуйста, обратитесь напрямую к администратору."
             )
             return
  
     await update.message.reply_text(
         "👋 Привет! Выберите действие:",
-        reply_markup=main_menu_kb(user_id),
+        reply_markup=main_menu_kb(update.effective_user.id),
     )
+ 
+async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not owner_only(update):
+        await update.message.reply_text("⛔ Эта команда доступна только владельцу бота.")
+        return
+    sub   = load_subscription()
+    price = sub["price"]
+    days_left = trial_days_left()
+    if days_left > 0 and not sub["paid_until"]:
+        await update.message.reply_text(
+            "ℹ️ Пробный период ещё активен — осталось *" + str(days_left) + "* дн.\n"
+            "Можете оплатить уже сейчас, чтобы продлить доступ заранее.",
+            parse_mode="Markdown",
+        )
+    await ctx.bot.send_invoice(
+        chat_id=update.effective_chat.id,
+        title="Подписка на бот-календарь",
+        description="Продление доступа к боту на 1 месяц",
+        payload="subscription:1month",
+        provider_token=PROVIDER_TOKEN,
+        currency="RUB",
+        prices=[LabeledPrice("Подписка на 1 месяц", price * 100)],  # в копейках
+    )
+ 
+async def cb_precheckout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    if query.invoice_payload != "subscription:1month":
+        await query.answer(ok=False, error_message="Неверный платёж.")
+        return
+    await query.answer(ok=True)
+ 
+async def cb_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    new_until = extend_subscription(1)
+    await update.message.reply_text(
+        "✅ Оплата получена! Подписка активна до *"
+        + new_until.strftime("%d.%m.%Y") + "*.\nБот снова доступен клиентам.",
+        parse_mode="Markdown",
+    )
+    await ctx.bot.send_message(
+        DEVELOPER_ID,
+        "💰 Получена оплата подписки от владельца бота. Активна до "
+        + new_until.strftime("%d.%m.%Y") + ".",
+    )
+ 
+async def cmd_setprice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not developer_only(update):
+        return  # тихо игнорируем, чтобы не раскрывать существование команды
+    args = ctx.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Использование: /setprice 900")
+        return
+    new_price = int(args[0])
+    set_subscription_price(new_price)
+    await update.message.reply_text("✅ Новая цена подписки: " + str(new_price) + " ₽/мес")
  
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
@@ -1205,91 +1271,25 @@ async def handle_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
  
 # ── Build app ─────────────────────────────────────────────────────────────────
  
-# ── Subscription handlers ────────────────────────────────────────────────────
- 
-async def cb_sub_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Показываем статус подписки владельцу"""
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    row = get_subscription(user_id)
- 
-    if row:
-        exp      = row[0]
-        is_trial = row[1]
-        days_left = max(0, (exp - datetime.now()).days)
-        status = "🎁 Пробный период" if is_trial else "✅ Платная подписка"
-        text = (
-            f"{status}\n"
-            f"Действует до: {exp.strftime('%d.%m.%Y')}\n"
-            f"Осталось дней: {days_left}"
-        )
-        if days_left <= 14:
-            text += f"\n\n⚠️ Заканчивается через {days_left} дней. Оформите подписку чтобы не потерять доступ."
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Оформить подписку — 900 ₽", callback_data="subscribe")],
-                [InlineKeyboardButton("« Назад", callback_data="back_start")],
-            ])
-        else:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("« Назад", callback_data="back_start")],
-            ])
-    else:
-        text = "У вас нет активной подписки."
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 Оформить подписку — 900 ₽/мес", callback_data="subscribe")],
-        ])
- 
-    await query.edit_message_text(text, reply_markup=keyboard)
- 
- 
-async def cb_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Отправляем инвойс на оплату"""
-    query = update.callback_query
-    await query.answer()
-    if not PAYMENT_PROVIDER_TOKEN:
-        await query.answer("⚠️ Оплата пока не настроена. Обратитесь к разработчику.", show_alert=True)
+async def subscription_guard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Блокирует все действия клиентов (не владельца, не разработчика),
+    если пробный период истёк и подписка не оплачена.
+    Срабатывает раньше остальных хендлеров (group=-1)."""
+    uid_ = update.effective_user.id if update.effective_user else None
+    if uid_ in (OWNER, DEVELOPER_ID):
+        return  # владельцу и разработчику доступ не блокируем
+    if is_subscription_active():
         return
-    await ctx.bot.send_invoice(
-        chat_id=query.message.chat_id,
-        title="Подписка на бота записи",
-        description="Доступ ко всем функциям на 30 дней: запись, перенос, отмена, напоминания.",
-        payload="subscription_30days",
-        provider_token=PAYMENT_PROVIDER_TOKEN,
-        currency="RUB",
-        prices=[LabeledPrice("Подписка 30 дней", SUBSCRIPTION_PRICE)],
-    )
- 
- 
-async def pre_checkout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Подтверждаем платёж"""
-    query = update.pre_checkout_query
-    if query.invoice_payload == "subscription_30days":
-        await query.answer(ok=True)
-    else:
-        await query.answer(ok=False, error_message="Неизвестный платёж")
- 
- 
-async def successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Активируем подписку после оплаты"""
-    user_id = update.effective_user.id
-    set_subscription(user_id, SUBSCRIPTION_DAYS, is_trial=False)
-    row = get_subscription(user_id)
-    exp = row[0].strftime('%d.%m.%Y')
-    await update.message.reply_text(
-        f"✅ Подписка активирована!\n"
-        f"Действует до: {exp}\n\n"
-        f"Все функции бота доступны.",
-        reply_markup=main_menu_kb(user_id)
-    )
-    await ctx.bot.send_message(
-        OWNER,
-        f"💰 Новая оплата!\n"
-        f"Пользователь: {update.effective_user.full_name}\n"
-        f"ID: {user_id}\n"
-        f"Сумма: {update.message.successful_payment.total_amount // 100} ₽"
-    )
- 
+    if update.callback_query:
+        await update.callback_query.answer(
+            "Бот временно недоступен.", show_alert=True
+        )
+        raise ApplicationHandlerStop
+    if update.message:
+        await update.message.reply_text(
+            "🙁 Бот временно недоступен. Пожалуйста, обратитесь напрямую к администратору."
+        )
+        raise ApplicationHandlerStop
  
 def build_telegram_app():
     app = Application.builder().token(TOKEN).build()
@@ -1366,8 +1366,15 @@ def build_telegram_app():
         conversation_timeout=600,
     )
  
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("cancel",  cmd_cancel))
+    app.add_handler(MessageHandler(filters.ALL, subscription_guard), group=-1)
+    app.add_handler(CallbackQueryHandler(subscription_guard), group=-1)
+ 
+    app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("cancel",    cmd_cancel))
+    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    app.add_handler(CommandHandler("setprice",  cmd_setprice))
+    app.add_handler(PreCheckoutQueryHandler(cb_precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, cb_successful_payment))
     app.add_handler(book_conv)
     app.add_handler(rsch_conv)
     app.add_handler(settings_conv)
@@ -1376,10 +1383,6 @@ def build_telegram_app():
     app.add_handler(CallbackQueryHandler(cb_del,            pattern="^del:"))
     app.add_handler(CallbackQueryHandler(cb_back_start,     pattern="^back_start$"))
     app.add_handler(MessageHandler(filters.Document.ALL,    handle_doc))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-    app.add_handler(CallbackQueryHandler(cb_sub_info,  pattern="^sub_info$"))
-    app.add_handler(CallbackQueryHandler(cb_subscribe, pattern="^subscribe$"))
-    app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     app.job_queue.run_repeating(check_reminders, interval=300, first=10)
     return app
  
