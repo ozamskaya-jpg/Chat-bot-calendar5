@@ -31,10 +31,10 @@ OWNER     = int(os.environ["OWNER_ID"])
 DB_URL    = os.environ["DATABASE_URL"]
 API_TOKEN = os.environ.get("API_TOKEN", "changemesecrettoken")
 PORT      = int(os.environ.get("PORT", 8080))
- 
+
 # ── Подписка на бота (оплата владельцем через ЮKassa) ──────────────────────────
 DEVELOPER_ID   = int(os.environ["DEVELOPER_ID"])           # ваш Telegram ID (не владельца)
-PROVIDER_TOKEN = os.environ["PROVIDER_TOKEN"]               # провайдер-токен ЮKassa из BotFather
+PROVIDER_TOKEN = os.environ.get("PROVIDER_TOKEN", "")       # провайдер-токен ЮKassa из BotFather (можно добавить позже)
 TRIAL_DAYS     = int(os.environ.get("TRIAL_DAYS", 90))      # 3 месяца пробного периода
 DEFAULT_PRICE  = int(os.environ.get("SUB_PRICE", 900))      # цена по умолчанию, руб/мес
  
@@ -176,9 +176,9 @@ def del_vacation(vac_id: int):
         conn.commit()
     finally:
         conn.close()
- 
+
 # ── Подписка на бота ─────────────────────────────────────────────────────────
- 
+
 def load_subscription():
     conn = get_conn()
     try:
@@ -192,7 +192,7 @@ def load_subscription():
             }
     finally:
         conn.close()
- 
+
 def is_subscription_active():
     """True, если пробный период ещё идёт ИЛИ подписка оплачена и не истекла."""
     sub   = load_subscription()
@@ -208,7 +208,7 @@ def is_subscription_active():
         if today <= paid_until:
             return True
     return False
- 
+
 def trial_days_left():
     sub = load_subscription()
     trial_end = (
@@ -216,7 +216,7 @@ def trial_days_left():
         + timedelta(days=TRIAL_DAYS)
     )
     return (trial_end - date.today()).days
- 
+
 def extend_subscription(months: int = 1):
     """Продлевает оплаченный период на N месяцев от сегодня или от paid_until, если он в будущем."""
     sub   = load_subscription()
@@ -238,7 +238,7 @@ def extend_subscription(months: int = 1):
     finally:
         conn.close()
     return new_until
- 
+
 def set_subscription_price(new_price: int):
     conn = get_conn()
     try:
@@ -392,7 +392,7 @@ def user_events(tgid):
 def owner_only(update: Update):
     uid_ = update.effective_user.id if update.effective_user else None
     return uid_ == OWNER
- 
+
 def developer_only(update: Update):
     uid_ = update.effective_user.id if update.effective_user else None
     return uid_ == DEVELOPER_ID
@@ -682,7 +682,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     uid_ = update.effective_user.id if update.effective_user else None
- 
+
     if not is_subscription_active():
         if uid_ == OWNER:
             sub = load_subscription()
@@ -699,15 +699,21 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "🙁 Бот временно недоступен. Пожалуйста, обратитесь напрямую к администратору."
             )
             return
- 
+
     await update.message.reply_text(
         "👋 Привет! Выберите действие:",
         reply_markup=main_menu_kb(update.effective_user.id),
     )
- 
+
 async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not owner_only(update):
         await update.message.reply_text("⛔ Эта команда доступна только владельцу бота.")
+        return
+    if not PROVIDER_TOKEN:
+        await update.message.reply_text(
+            "⏳ Оплата подписки пока не подключена — ждём подтверждения от ЮKassa.\n"
+            "Как только всё будет готово, здесь появится возможность оплатить."
+        )
         return
     sub   = load_subscription()
     price = sub["price"]
@@ -727,14 +733,14 @@ async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         currency="RUB",
         prices=[LabeledPrice("Подписка на 1 месяц", price * 100)],  # в копейках
     )
- 
+
 async def cb_precheckout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
     if query.invoice_payload != "subscription:1month":
         await query.answer(ok=False, error_message="Неверный платёж.")
         return
     await query.answer(ok=True)
- 
+
 async def cb_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     new_until = extend_subscription(1)
     await update.message.reply_text(
@@ -747,7 +753,7 @@ async def cb_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "💰 Получена оплата подписки от владельца бота. Активна до "
         + new_until.strftime("%d.%m.%Y") + ".",
     )
- 
+
 async def cmd_setprice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not developer_only(update):
         return  # тихо игнорируем, чтобы не раскрывать существование команды
@@ -1290,7 +1296,7 @@ async def subscription_guard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "🙁 Бот временно недоступен. Пожалуйста, обратитесь напрямую к администратору."
         )
         raise ApplicationHandlerStop
- 
+
 def build_telegram_app():
     app = Application.builder().token(TOKEN).build()
  
@@ -1368,7 +1374,7 @@ def build_telegram_app():
  
     app.add_handler(MessageHandler(filters.ALL, subscription_guard), group=-1)
     app.add_handler(CallbackQueryHandler(subscription_guard), group=-1)
- 
+
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
@@ -1403,30 +1409,30 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
  
 async def run_all():
     init_db()
- 
+
     tg_app = build_telegram_app()
     tg_app.add_error_handler(on_error)
     await tg_app.initialize()
     await tg_app.start()
- 
+
     webhook_url = os.environ.get("WEBHOOK_URL", "").rstrip("/")
- 
+
     web_app = create_web_app()
- 
+
     # Добавляем эндпоинт для webhook
     async def telegram_webhook(request: web.Request) -> web.Response:
         data = await request.json()
         update = Update.de_json(data, tg_app.bot)
         await tg_app.process_update(update)
         return web.Response(status=200)
- 
+
     web_app.router.add_post("/telegram", telegram_webhook)
- 
+
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
- 
+
     # Регистрируем webhook в Telegram
     await tg_app.bot.set_webhook(
         url=webhook_url + "/telegram",
@@ -1434,15 +1440,15 @@ async def run_all():
     )
     logger.info("✅ Webhook установлен: %s/telegram", webhook_url)
     logger.info("✅ Бот v5 запущен (HTTP API на порту %s)", PORT)
- 
+
     # Graceful shutdown
     stop_event = asyncio.Event()
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
- 
+
     await stop_event.wait()
- 
+
     logger.info("Получен сигнал остановки, завершаем работу...")
     await tg_app.bot.delete_webhook()
     await tg_app.stop()
