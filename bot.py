@@ -724,33 +724,94 @@ async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Можете оплатить уже сейчас, чтобы продлить доступ заранее.",
             parse_mode="Markdown",
         )
+    price_year = round(price * 12 * 0.9)  # скидка 10% на годовую подписку
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "1 месяц — " + str(price) + " ₽", callback_data="sub_pay:month"
+        )],
+        [InlineKeyboardButton(
+            "1 год — " + str(price_year) + " ₽ (скидка 10%)", callback_data="sub_pay:year"
+        )],
+    ])
+    await update.message.reply_text(
+        "Выберите период подписки:", reply_markup=kb
+    )
+
+async def cb_subscribe_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not owner_only(update):
+        await query.answer("⛔ Доступно только владельцу бота.", show_alert=True)
+        return
+    await query.answer()
+    period = query.data.replace("sub_pay:", "")  # "month" или "year"
+    await send_subscription_invoice(update.effective_chat.id, ctx, period)
+
+async def send_subscription_invoice(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, period: str):
+    sub   = load_subscription()
+    price = sub["price"]
+    if period == "year":
+        amount      = round(price * 12 * 0.9)
+        title       = "Подписка на бот-календарь — 1 год"
+        description = "Продление доступа к боту на 12 месяцев (скидка 10%)"
+        payload     = "subscription:1year"
+        label       = "Подписка на 1 год"
+        item_desc   = "Подписка на бот-календарь (12 месяцев, скидка 10%)"
+    else:
+        amount      = price
+        title       = "Подписка на бот-календарь — 1 месяц"
+        description = "Продление доступа к боту на 1 месяц"
+        payload     = "subscription:1month"
+        label       = "Подписка на 1 месяц"
+        item_desc   = "Подписка на бот-календарь (1 месяц)"
+
+    receipt = {
+        "receipt": {
+            "items": [
+                {
+                    "description": item_desc,
+                    "quantity": "1.00",
+                    "amount": {
+                        "value": "{:.2f}".format(amount),
+                        "currency": "RUB",
+                    },
+                    "vat_code": 1,
+                }
+            ]
+        }
+    }
     await ctx.bot.send_invoice(
-        chat_id=update.effective_chat.id,
-        title="Подписка на бот-календарь",
-        description="Продление доступа к боту на 1 месяц",
-        payload="subscription:1month",
+        chat_id=chat_id,
+        title=title,
+        description=description,
+        payload=payload,
         provider_token=PROVIDER_TOKEN,
         currency="RUB",
-        prices=[LabeledPrice("Подписка на 1 месяц", price * 100)],  # в копейках
+        prices=[LabeledPrice(label, amount * 100)],  # в копейках
+        need_email=True,
+        send_email_to_provider=True,
+        provider_data=json.dumps(receipt),
     )
 
 async def cb_precheckout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
-    if query.invoice_payload != "subscription:1month":
+    if query.invoice_payload not in ("subscription:1month", "subscription:1year"):
         await query.answer(ok=False, error_message="Неверный платёж.")
         return
     await query.answer(ok=True)
 
 async def cb_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    new_until = extend_subscription(1)
+    payload = update.message.successful_payment.invoice_payload
+    months  = 12 if payload == "subscription:1year" else 1
+    new_until = extend_subscription(months)
+    period_label = "1 год" if months == 12 else "1 месяц"
     await update.message.reply_text(
-        "✅ Оплата получена! Подписка активна до *"
+        "✅ Оплата получена (" + period_label + ")! Подписка активна до *"
         + new_until.strftime("%d.%m.%Y") + "*.\nБот снова доступен клиентам.",
         parse_mode="Markdown",
     )
     await ctx.bot.send_message(
         DEVELOPER_ID,
-        "💰 Получена оплата подписки от владельца бота. Активна до "
+        "💰 Получена оплата подписки (" + period_label + ") от владельца бота. Активна до "
         + new_until.strftime("%d.%m.%Y") + ".",
     )
 
@@ -1378,6 +1439,7 @@ def build_telegram_app():
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    app.add_handler(CallbackQueryHandler(cb_subscribe_period, pattern="^sub_pay:"))
     app.add_handler(CommandHandler("setprice",  cmd_setprice))
     app.add_handler(PreCheckoutQueryHandler(cb_precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, cb_successful_payment))
