@@ -63,16 +63,22 @@ async def max_request(method: str, path: str, **kwargs):
  
 async def max_send(chat_id: int, text: str, buttons: list[list[dict]] | None = None,
                     fmt: str = "markdown"):
-    """Отправляет сообщение. buttons — список рядов кнопок [[{...}, {...}], ...]."""
+    """Отправляет сообщение. buttons — список рядов кнопок [[{...}, {...}], ...].
+    Если отправка с кнопками не удаётся (например, MAX не может подтвердить
+    мини-приложение в open_app-кнопке) — повторяем без кнопок, чтобы хотя бы
+    текст дошёл и бот не "молчал"."""
     body = {"text": text, "format": fmt}
     if buttons:
         body["attachments"] = [{
             "type": "inline_keyboard",
             "payload": {"buttons": buttons},
         }]
-    return await max_request(
-        "POST", "/messages", params={"chat_id": chat_id}, json=body
-    )
+    result = await max_request("POST", "/messages", params={"chat_id": chat_id}, json=body)
+    if buttons and isinstance(result, dict) and result.get("code"):
+        logger.warning("Отправка с кнопками не удалась (%s), повторяю без кнопок", result.get("code"))
+        body.pop("attachments", None)
+        result = await max_request("POST", "/messages", params={"chat_id": chat_id}, json=body)
+    return result
  
  
 async def max_answer_callback(callback_id: str, text: str | None = None):
@@ -100,20 +106,22 @@ async def max_set_subscription(webhook_url: str):
  
 # ── UI ──────────────────────────────────────────────────────────────────────
  
-def main_menu_buttons(chat_id: int | None = None):
-    buttons = [
+def main_menu_buttons():
+    return [
         [btn_cb("📅 Записаться", "book")],
         [btn_cb("🔄 Перенести запись", "reschedule")],
         [btn_cb("📋 Мои записи", "my_bookings")],
         [btn_cb("❌ Отменить запись", "cancel_booking")],
     ]
-    if chat_id == MAX_OWNER and MAX_BOT_USERNAME:
-        buttons.append([btn_open_app("🗓 Открыть календарь")])
-    return buttons
  
  
 async def show_main_menu(chat_id: int, greeting: str = "Выберите действие:"):
-    await max_send(chat_id, greeting, main_menu_buttons(chat_id))
+    await max_send(chat_id, greeting, main_menu_buttons())
+    if chat_id == MAX_OWNER and MAX_BOT_USERNAME:
+        try:
+            await max_send(chat_id, "Доступ владельца:", [[btn_open_app("🗓 Открыть календарь")]])
+        except Exception as e:
+            logger.warning("Не удалось отправить кнопку календаря: %s", e)
  
  
 # ── сценарий брони ───────────────────────────────────────────────────────
