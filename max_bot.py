@@ -35,6 +35,7 @@ from bot import (
 logger = logging.getLogger("max_bot")
  
 MAX_TOKEN = os.environ["MAX_BOT_TOKEN"]          # токен из MAX Developer Console
+MAX_BOT_USERNAME = os.environ.get("MAX_BOT_USERNAME", "")  # имя бота без @, для кнопки открытия мини-приложения
 MAX_API   = "https://platform-api.max.ru"
 HEADERS   = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
  
@@ -84,6 +85,10 @@ def btn_cb(text: str, payload: str) -> dict:
     return {"type": "callback", "text": text, "payload": payload}
  
  
+def btn_open_app(text: str) -> dict:
+    return {"type": "open_app", "text": text, "web_app": MAX_BOT_USERNAME}
+ 
+ 
 async def max_set_subscription(webhook_url: str):
     """Регистрирует webhook при старте приложения (вызывать один раз)."""
     return await max_request("POST", "/subscriptions", json={
@@ -94,17 +99,20 @@ async def max_set_subscription(webhook_url: str):
  
 # ── UI ──────────────────────────────────────────────────────────────────────
  
-def main_menu_buttons():
-    return [
+def main_menu_buttons(chat_id: int | None = None):
+    buttons = [
         [btn_cb("📅 Записаться", "book")],
         [btn_cb("🔄 Перенести запись", "reschedule")],
         [btn_cb("📋 Мои записи", "my_bookings")],
         [btn_cb("❌ Отменить запись", "cancel_booking")],
     ]
+    if chat_id == OWNER and MAX_BOT_USERNAME:
+        buttons.append([btn_open_app("🗓 Открыть календарь")])
+    return buttons
  
  
 async def show_main_menu(chat_id: int, greeting: str = "Выберите действие:"):
-    await max_send(chat_id, greeting, main_menu_buttons())
+    await max_send(chat_id, greeting, main_menu_buttons(chat_id))
  
  
 # ── сценарий брони ───────────────────────────────────────────────────────
