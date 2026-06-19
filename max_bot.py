@@ -92,8 +92,11 @@ def btn_cb(text: str, payload: str) -> dict:
     return {"type": "callback", "text": text, "payload": payload}
  
  
-def btn_open_app(text: str) -> dict:
-    return {"type": "open_app", "text": text, "web_app": MAX_BOT_USERNAME}
+CALENDAR_URL = os.environ.get("CALENDAR_URL", "https://calendar-interface-finamira.netlify.app")
+ 
+ 
+def btn_link(text: str, url: str) -> dict:
+    return {"type": "link", "text": text, "url": url}
  
  
 async def max_set_subscription(webhook_url: str):
@@ -117,9 +120,9 @@ def main_menu_buttons():
  
 async def show_main_menu(chat_id: int, greeting: str = "Выберите действие:"):
     await max_send(chat_id, greeting, main_menu_buttons())
-    if chat_id == MAX_OWNER and MAX_BOT_USERNAME:
+    if chat_id == MAX_OWNER:
         try:
-            await max_send(chat_id, "Доступ владельца:", [[btn_open_app("🗓 Открыть календарь")]])
+            await max_send(chat_id, "Доступ владельца:", [[btn_link("🗓 Открыть календарь", CALENDAR_URL)]])
         except Exception as e:
             logger.warning("Не удалось отправить кнопку календаря: %s", e)
  
