@@ -35,6 +35,7 @@ from bot import (
 logger = logging.getLogger("max_bot")
  
 MAX_TOKEN = os.environ["MAX_BOT_TOKEN"]          # токен из MAX Developer Console
+MAX_OWNER = int(os.environ.get("MAX_OWNER_ID", "0"))  # ваш ID пользователя именно в MAX (не Telegram!)
 MAX_BOT_USERNAME = os.environ.get("MAX_BOT_USERNAME", "")  # имя бота без @, для кнопки открытия мини-приложения
 MAX_API   = "https://platform-api.max.ru"
 HEADERS   = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
@@ -106,7 +107,7 @@ def main_menu_buttons(chat_id: int | None = None):
         [btn_cb("📋 Мои записи", "my_bookings")],
         [btn_cb("❌ Отменить запись", "cancel_booking")],
     ]
-    if chat_id == OWNER and MAX_BOT_USERNAME:
+    if chat_id == MAX_OWNER and MAX_BOT_USERNAME:
         buttons.append([btn_open_app("🗓 Открыть календарь")])
     return buttons
  
@@ -398,7 +399,7 @@ async def handle_max_webhook(request):
         callback_id = cb["callback_id"]
         await max_answer_callback(callback_id)
  
-        if not is_subscription_active() and chat_id != OWNER:
+        if not is_subscription_active() and chat_id != MAX_OWNER:
             await max_send(chat_id, "Бот временно недоступен.")
             return web.Response(status=200)
  
@@ -420,27 +421,27 @@ async def handle_max_webhook(request):
         elif payload.startswith("del:"):
             delete_event(payload.split(":", 1)[1])
             await max_send(chat_id, "Запись отменена.")
-        elif payload == "set_wd" and chat_id == OWNER:
+        elif payload == "set_wd" and chat_id == MAX_OWNER:
             await show_wd_menu(chat_id)
-        elif payload.startswith("togwd:") and chat_id == OWNER:
+        elif payload.startswith("togwd:") and chat_id == MAX_OWNER:
             await toggle_wd(chat_id, int(payload.split(":", 1)[1]))
-        elif payload == "set_wtime" and chat_id == OWNER:
+        elif payload == "set_wtime" and chat_id == MAX_OWNER:
             await ask_wtime(chat_id)
-        elif payload == "set_lunch" and chat_id == OWNER:
+        elif payload == "set_lunch" and chat_id == MAX_OWNER:
             await ask_lunch(chat_id)
-        elif payload == "set_sd" and chat_id == OWNER:
+        elif payload == "set_sd" and chat_id == MAX_OWNER:
             await show_sd_menu(chat_id)
-        elif payload.startswith("setsd:") and chat_id == OWNER:
+        elif payload.startswith("setsd:") and chat_id == MAX_OWNER:
             await set_sd_value(chat_id, int(payload.split(":", 1)[1]))
-        elif payload == "set_vac" and chat_id == OWNER:
+        elif payload == "set_vac" and chat_id == MAX_OWNER:
             await ask_vac(chat_id)
-        elif payload == "set_delvac" and chat_id == OWNER:
+        elif payload == "set_delvac" and chat_id == MAX_OWNER:
             await show_delvac_menu(chat_id)
-        elif payload.startswith("delvac:") and chat_id == OWNER:
+        elif payload.startswith("delvac:") and chat_id == MAX_OWNER:
             await delete_vac(chat_id, int(payload.split(":", 1)[1]))
-        elif payload == "set_back" and chat_id == OWNER:
+        elif payload == "set_back" and chat_id == MAX_OWNER:
             await show_settings_menu(chat_id)
-        elif payload == "set_close" and chat_id == OWNER:
+        elif payload == "set_close" and chat_id == MAX_OWNER:
             STATE.pop(chat_id, None)
             await max_send(chat_id, "Настройки закрыты.")
         return web.Response(status=200)
@@ -451,7 +452,7 @@ async def handle_max_webhook(request):
         chat_id = msg["recipient"]["chat_id"]
         text = (msg.get("body") or {}).get("text", "").strip()
  
-        if not is_subscription_active() and chat_id != OWNER:
+        if not is_subscription_active() and chat_id != MAX_OWNER:
             await max_send(chat_id, "Бот временно недоступен.")
             return web.Response(status=200)
  
@@ -460,21 +461,25 @@ async def handle_max_webhook(request):
             await show_main_menu(chat_id, "Здравствуйте! Выберите действие:")
             return web.Response(status=200)
  
+        if text == "/myid":
+            await max_send(chat_id, f"Ваш chat_id в MAX: {chat_id}")
+            return web.Response(status=200)
+ 
         if text == "/settings":
-            if chat_id != OWNER:
+            if chat_id != MAX_OWNER:
                 await max_send(chat_id, "⛔ Нет доступа.")
                 return web.Response(status=200)
             await show_settings_menu(chat_id)
             return web.Response(status=200)
  
         st = STATE.get(chat_id)
-        if st and chat_id == OWNER and st.get("step") == SET_WS:
+        if st and chat_id == MAX_OWNER and st.get("step") == SET_WS:
             await got_wtime(chat_id, text)
             return web.Response(status=200)
-        if st and chat_id == OWNER and st.get("step") == SET_LS:
+        if st and chat_id == MAX_OWNER and st.get("step") == SET_LS:
             await got_lunch(chat_id, text)
             return web.Response(status=200)
-        if st and chat_id == OWNER and st.get("step") == SET_VAC:
+        if st and chat_id == MAX_OWNER and st.get("step") == SET_VAC:
             await got_vac(chat_id, text)
             return web.Response(status=200)
  
